@@ -58,6 +58,10 @@ jobs:
         shell: bash
         run: ./tests/start-monk-agent-fastpath.sh
 
+      - name: Check installer lock deadline
+        shell: bash
+        run: ./tests/ensure-monk-agent-lock-timeout.sh
+
       - name: Check launcher readiness deadline
         shell: bash
         run: ./tests/start-monk-agent-readiness-timeout.sh
