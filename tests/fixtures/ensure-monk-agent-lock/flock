@@ -2,6 +2,8 @@
 """Small cross-platform flock(1) fixture for installer lock tests."""
 
 import fcntl
+import os
+import pathlib
 import sys
 import time
 
@@ -24,6 +26,10 @@ def main() -> int:
         return 2
 
     fd = int(args[0])
+    wait_started = os.environ.get("MONK_TEST_FLOCK_WAIT_STARTED")
+    if timeout is not None and wait_started:
+        pathlib.Path(wait_started).touch()
+
     if not nonblocking and timeout is None:
         fcntl.flock(fd, fcntl.LOCK_EX)
         return 0

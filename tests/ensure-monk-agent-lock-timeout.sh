@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
-# Regression coverage for a wedged concurrent installer: every shipped POSIX
-# bootstrap must stop waiting after the configured lock deadline.
+# Regression coverage for concurrent installers: every shipped POSIX bootstrap
+# must stop at the lock deadline, while a lock released in time must recover.
 set -eu
 
 repo_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
@@ -20,6 +20,49 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
+start_lock_holder() {
+  lock_path="$1"
+  ready_path="$2"
+  release_path="${3:-}"
+
+  python3 - "$lock_path" "$ready_path" "$release_path" <<'PY' &
+import fcntl
+import pathlib
+import sys
+import time
+
+lock_path, ready_path, release_path = sys.argv[1:]
+with open(lock_path, "w", encoding="utf-8") as lock_file:
+    fcntl.flock(lock_file, fcntl.LOCK_EX)
+    pathlib.Path(ready_path).touch()
+    if not release_path:
+        time.sleep(30)
+    else:
+        deadline = time.monotonic() + 5
+        while not pathlib.Path(release_path).exists():
+            if time.monotonic() >= deadline:
+                raise TimeoutError("installer never began its bounded lock wait")
+            time.sleep(0.02)
+PY
+  holder_pid=$!
+
+  waited=0
+  while [ ! -e "$ready_path" ]; do
+    waited=$((waited + 1))
+    if [ "$waited" -ge 50 ]; then
+      echo "lock holder did not become ready for $lock_path" >&2
+      exit 1
+    fi
+    sleep 0.1
+  done
+}
+
+stop_lock_holder() {
+  kill "$holder_pid" 2>/dev/null || true
+  wait "$holder_pid" 2>/dev/null || true
+  holder_pid=""
+}
+
 case_no=0
 for ensure_script in \
   "$repo_root/scripts/ensure-monk-agent.sh" \
@@ -34,29 +77,7 @@ do
   timeout_marker="$case_dir/watchdog-fired"
   mkdir -p "$install_dir"
 
-  python3 - "$install_dir/.monk-agent.lock" "$ready_file" <<'PY' &
-import fcntl
-import pathlib
-import sys
-import time
-
-lock_path, ready_path = sys.argv[1:]
-with open(lock_path, "w", encoding="utf-8") as lock_file:
-    fcntl.flock(lock_file, fcntl.LOCK_EX)
-    pathlib.Path(ready_path).touch()
-    time.sleep(30)
-PY
-  holder_pid=$!
-
-  waited=0
-  while [ ! -e "$ready_file" ]; do
-    waited=$((waited + 1))
-    if [ "$waited" -ge 50 ]; then
-      echo "lock holder did not become ready for $ensure_script" >&2
-      exit 1
-    fi
-    sleep 0.1
-  done
+  start_lock_holder "$install_dir/.monk-agent.lock" "$ready_file"
 
   set +e
   PATH="$fixture_bin:$PATH" \
@@ -81,9 +102,7 @@ PY
   wait "$watchdog_pid" 2>/dev/null || true
   watchdog_pid=""
 
-  kill "$holder_pid" 2>/dev/null || true
-  wait "$holder_pid" 2>/dev/null || true
-  holder_pid=""
+  stop_lock_holder
 
   if [ -e "$timeout_marker" ]; then
     echo "$ensure_script waited indefinitely for the install lock" >&2
@@ -99,5 +118,48 @@ PY
     exit 1
   fi
 done
+
+# Also prove that the bounded wait does not reject an ordinary concurrent
+# install that finishes before the deadline. A pre-existing executable keeps
+# this path network-free after the lock is acquired.
+recovery_dir="$work_dir/recovery"
+install_dir="$recovery_dir/install"
+ready_file="$recovery_dir/holder-ready"
+wait_started="$recovery_dir/wait-started"
+stdout_file="$recovery_dir/stdout"
+stderr_file="$recovery_dir/stderr"
+target="$install_dir/monk-agent"
+mkdir -p "$install_dir"
+printf '#!/usr/bin/env sh\nexit 0\n' >"$target"
+chmod +x "$target"
+
+start_lock_holder "$install_dir/.monk-agent.lock" "$ready_file" "$wait_started"
+
+set +e
+PATH="$fixture_bin:$PATH" \
+MONK_AGENT_INSTALL_DIR="$install_dir" \
+MONK_AGENT_INSTALL_LOCK_TIMEOUT=3 \
+MONK_AGENT_AUTO_UPDATE=0 \
+MONK_TEST_FLOCK_WAIT_STARTED="$wait_started" \
+  "$repo_root/scripts/ensure-monk-agent.sh" >"$stdout_file" 2>"$stderr_file"
+status=$?
+set -e
+stop_lock_holder
+
+if [ "$status" -ne 0 ]; then
+  echo "installer did not recover after the lock was released" >&2
+  cat "$stderr_file" >&2
+  exit 1
+fi
+if [ "$(cat "$stdout_file")" != "$target" ]; then
+  echo "installer returned the wrong managed binary after lock recovery" >&2
+  cat "$stdout_file" >&2
+  exit 1
+fi
+if ! grep -Fq "Another monk-agent install is in progress; waiting up to 3s..." "$stderr_file"; then
+  echo "installer did not report the bounded lock wait before recovery" >&2
+  cat "$stderr_file" >&2
+  exit 1
+fi
 
 echo "ensure-monk-agent lock-timeout tests passed."
